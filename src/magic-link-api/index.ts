@@ -441,6 +441,61 @@ export default defineEndpoint((router, { services, database, env, logger }) => {
 		}
 	}
 
+	// Mint a real Directus session (access + refresh token) for a user whose
+	// identity the CALLER has already proven — e.g. a BFF that verifies its own
+	// signed magic links. Admin-token only: an admin can already impersonate any
+	// user, so this grants nothing new. Each call is an independent session, so
+	// re-verifying on another device never kills an earlier one.
+	router.post('/session', async (req, res) => {
+		if (!req.accountability?.admin) {
+			return res.status(403).send({ success: false, message: 'Forbidden' });
+		}
+
+		const { userId, ip, userAgent } = req.body ?? {};
+		if (typeof userId !== 'string' || !userId) {
+			return res.status(400).send({ success: false, message: 'userId is required' });
+		}
+
+		try {
+			const user = await database
+				.select('id', 'status')
+				.from('directus_users')
+				.where({ id: userId })
+				.first();
+			if (!user || user.status !== 'active') {
+				return res.status(404).send({ success: false, message: 'User not found or inactive' });
+			}
+
+			// Seed session; `refresh()` immediately rotates it and applies REFRESH_TOKEN_TTL.
+			const seedToken = crypto.randomBytes(32).toString('hex');
+			await database('directus_sessions').insert({
+				token: seedToken,
+				user: user.id,
+				expires: new Date(Date.now() + 60_000),
+				ip: typeof ip === 'string' ? ip : null,
+				user_agent: typeof userAgent === 'string' ? userAgent : null,
+				origin: null
+			});
+
+			const authenticationService = new AuthenticationService({
+				accountability: {
+					ip: typeof ip === 'string' ? ip : null,
+					userAgent: typeof userAgent === 'string' ? userAgent : undefined
+				},
+				schema: req.schema
+			});
+			const { accessToken, refreshToken, expires } = await authenticationService.refresh(seedToken);
+
+			return res.send({
+				success: true,
+				data: { access_token: accessToken, refresh_token: refreshToken, expires }
+			});
+		} catch (error) {
+			logger.error(`Magic link session mint failed: ${error.message}`);
+			return res.status(500).send({ success: false, message: 'Session creation failed' });
+		}
+	});
+
 	// Verify magic link
 	router.get('/verify', async (req, res) => {
 		try {
